@@ -20,6 +20,11 @@
   #zone p { color:var(--dim); }
   #status { margin-top:18px; min-height:1.4em; color:var(--dim); }
   #status.err { color:#f7768e; }
+  #urlForm { display:flex; gap:8px; margin-top:16px; }
+  #urlInput { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:11px 12px; }
+  #urlForm button { background:#22252a; border:1px solid var(--line); border-radius:10px; padding:0 16px; cursor:pointer; }
+  #urlForm button:hover { border-color:var(--accent); }
+  #proxyRow { display:flex; gap:8px; align-items:flex-start; margin-top:10px; color:var(--dim); font-size:13px; }
 
   /* Player */
   #player { position:fixed; inset:0; background:#000; display:flex; flex-direction:column; }
@@ -54,13 +59,18 @@
       <h1>Drop one or more .rar files here</h1>
       <p>or click to choose one. Images are read into memory only. Nothing is saved.</p>
     </div>
+    <form id="urlForm" autocomplete="off">
+      <input id="urlInput" type="text" inputmode="url" placeholder="…or paste a web page or image link" aria-label="Web page link">
+      <button type="submit">Load images</button>
+    </form>
+    <label id="proxyRow"><input type="checkbox" id="useProxy" checked> If the site blocks direct access, use a public proxy (the proxy can see the link)</label>
     <p id="status" role="status"></p>
     <input id="picker" type="file" multiple accept=".rar,application/vnd.rar,application/x-rar-compressed" hidden>
   </div>
 </section>
 
 <section id="player" hidden>
-  <div id="stage"><div id="frame"><img id="img" alt=""></div></div>
+  <div id="stage"><div id="frame"><img id="img" alt="" referrerpolicy="no-referrer"></div></div>
   <div id="bar">
     <button id="prev" aria-label="Previous image">Prev</button>
     <button id="play" aria-label="Play or pause">Pause</button>
@@ -104,6 +114,7 @@ let timer = null;
 let wasmBinary = null;
 let order = [];       // play order: positions -> slide indexes
 let shuffle = false;
+let failStreak = 0;
 
 function buildOrder(cur) {
   order = slides.map((_, i) => i);
@@ -126,9 +137,18 @@ function sniff(b) {
   if (s(4, "ftypavif")) return "image/avif";
   return null;
 }
+$("img").addEventListener("load", () => { failStreak = 0; });
 $("img").addEventListener("error", async () => {
   if (!slides.length) return;
   const sl = slides[order[index]];
+  if (sl.remote) {
+    $("name").textContent = `Could not load ${sl.remote}`;
+    if (playing && ++failStreak < slides.length) {   // skip broken images, stop if all fail
+      clearTimeout(timer);
+      timer = setTimeout(() => { show(index + 1); schedule(); }, 600);
+    }
+    return;
+  }
   let extra = "";
   try {
     const head = new DataView(await sl.blob.slice(0, 32).arrayBuffer());
@@ -203,15 +223,75 @@ async function loadArchives(fileList) {
   show(0); schedule(); updatePlayLabel();
 }
 
+/* ---------- Load from a web link ---------- */
+const IMG_RE = /\.(jpe?g|png|gif|webp|avif|bmp)(\?|#|$)/i;
+const JUNK_RE = /(favicon|sprite|spacer|blank\.|pixel|tracking|\.svg|\.ico)/i;
+
+async function fetchPage(u, allowProxy) {
+  const tries = [u];
+  if (allowProxy) tries.push("https://corsproxy.io/?url=" + encodeURIComponent(u), "https://api.allorigins.win/raw?url=" + encodeURIComponent(u));
+  for (const t of tries) {
+    try { const r = await fetch(t, { referrerPolicy: "no-referrer" }); if (r.ok) return await r.text(); } catch {}
+  }
+  throw new Error("blocked");
+}
+
+function extractImages(html, pageUrl) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  let base = pageUrl;
+  try { base = new URL(doc.querySelector("base[href]")?.getAttribute("href") || "", pageUrl).href; } catch {}
+  const urls = [];
+  const add = (raw, skipJunk) => {
+    if (!raw) return;
+    let u; try { u = new URL(raw.trim(), base).href; } catch { return; }
+    if (!/^https?:/i.test(u) || (skipJunk && JUNK_RE.test(u)) || urls.includes(u)) return;
+    urls.push(u);
+  };
+  const biggest = ss => ss.split(",").map(p => p.trim().split(/\s+/)).map(([u, d]) => [u, parseFloat(d) || 1]).sort((a, b) => b[1] - a[1])[0]?.[0];
+  doc.querySelectorAll("img").forEach(im => {
+    const a = im.closest("a[href]");
+    const href = a?.getAttribute("href");
+    if (href && IMG_RE.test(href)) { add(href); return; }          // full-size link wraps the thumbnail
+    const ss = im.getAttribute("srcset") || im.getAttribute("data-srcset");
+    add((ss && biggest(ss)) || im.getAttribute("data-src") || im.getAttribute("data-original") || im.getAttribute("data-lazy-src") || im.getAttribute("src"), true);
+  });
+  doc.querySelectorAll("a[href]").forEach(a => { const h = a.getAttribute("href"); if (IMG_RE.test(h)) add(h); });
+  if (!urls.length) doc.querySelectorAll('meta[property="og:image"]').forEach(m => add(m.content));
+  return urls;
+}
+
+async function loadFromUrl(input) {
+  let u = input.trim();
+  if (!u) return;
+  if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+  let list;
+  if (IMG_RE.test(u)) list = [u];
+  else {
+    setStatus("Fetching page…");
+    try { list = extractImages(await fetchPage(u, $("useProxy").checked), u); }
+    catch {
+      setStatus("Could not read that page. The site blocks outside access" + ($("useProxy").checked ? ", even through the proxy." : ". Try enabling the proxy option."), true);
+      return;
+    }
+  }
+  if (!list.length) { setStatus("No images found. The page may load its images with JavaScript, which this can't read.", true); return; }
+  slides = list.slice(0, 500).map((url, i) => ({ name: url, remote: url }));
+  index = 0; order = []; buildOrder(0); playing = true; failStreak = 0;
+  $("drop").hidden = true; $("player").hidden = false;
+  setStatus("");
+  show(0); schedule(); updatePlayLabel();
+}
+$("urlForm").addEventListener("submit", e => { e.preventDefault(); loadFromUrl($("urlInput").value); });
+
 /* ---------- Display ---------- */
 function show(i) {
   if (!slides.length) return;
   if (shuffle && i >= slides.length && slides.length > 1) { buildOrder(order[slides.length - 1]); i = 1; }
   index = (i + slides.length) % slides.length;
   const img = $("img");
-  const old = currentUrl;
-  currentUrl = URL.createObjectURL(slides[order[index]].blob);
-  img.src = currentUrl;
+  const old = currentUrl, sl = slides[order[index]];
+  if (sl.blob) { currentUrl = URL.createObjectURL(sl.blob); img.src = currentUrl; }
+  else { currentUrl = null; img.src = sl.remote; }   // linked image from a web page
   if (old) URL.revokeObjectURL(old);   // revoke the previous image immediately
   $("count").textContent = `${index + 1} / ${slides.length}`;
   $("name").textContent = slides[order[index]].name;
